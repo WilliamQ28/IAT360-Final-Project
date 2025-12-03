@@ -1,282 +1,5 @@
-#!/usr/bin/env python3
-"""
-Generate web copy with optional RAG context using the HF router chat API.
-Supports staged mode (site name -> hero -> sections with light linkage) or
-legacy single-body mode sized by width/height.
-"""
-
-import argparse
-import json
-import math
-import os
-import random
-import textwrap
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-import requests
-
-
-DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct:together"  # chat-completions via HF router
-DEFAULT_CHAR_WIDTH_FACTOR = 0.52  # avg em width vs font size
-DEFAULT_LINE_HEIGHT = 1.4
-DEFAULT_FILL_RATIO = 0.9
-MAX_CONTEXT_CHUNKS = 3
-DEFAULT_SECTION_CHAR_MIN = 250
-DEFAULT_SECTION_CHAR_MAX = 400
-DEFAULT_HERO_TITLE_CHARS = 80
-DEFAULT_HERO_SUBTITLE_CHARS = 200
-DEFAULT_SECTION_PARA_COUNT = 3
-
-
-# ---------------- helpers ----------------
-
-def clamp(val: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, val))
-
-
-def estimate_char_budget(
-    width_px: float,
-    height_px: float,
-    font_size_px: float = 16.0,
-    line_height: float = DEFAULT_LINE_HEIGHT,
-    char_width_factor: float = DEFAULT_CHAR_WIDTH_FACTOR,
-    fill_ratio: float = DEFAULT_FILL_RATIO,
-    min_chars: int = 120,
-    max_chars: int = 1200,
-) -> int:
-    """Estimate characters that fit inside a text box."""
-    width_px = max(16.0, width_px)
-    height_px = max(16.0, height_px)
-    font_size_px = max(8.0, font_size_px)
-    line_height_px = font_size_px * max(1.05, line_height)
-
-    chars_per_line = width_px / (font_size_px * max(0.3, char_width_factor))
-    line_count = height_px / line_height_px
-    rough_budget = int(chars_per_line * line_count * clamp(fill_ratio, 0.5, 1.0))
-    return int(clamp(rough_budget, float(min_chars), float(max_chars)))
-
-
-def budget_to_max_tokens(char_budget: int, safety: float = 1.3) -> int:
-    """Convert character budget to token limit for LLM."""
-    return int(math.ceil((char_budget / 4.0) * safety))
-
-
-def load_rag(path: Optional[Path], max_items: Optional[int] = None) -> List[dict]:
-    if not path:
-        return []
-    if not path.exists():
-        return []
-    items: List[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                items.append(rec)
-            except Exception:
-                continue
-            if max_items and len(items) >= max_items:
-                break
-    return items
-
-
-def pick_context(
-    rag: Sequence[dict],
-    strategy: str,
-    max_chunks: int,
-    content_type: str,
-) -> List[dict]:
-    if not rag or max_chunks <= 0:
-        return []
-    if strategy == "topic" and content_type:
-        filtered = [r for r in rag if content_type.lower() in str(r.get("topic", "")).lower()]
-        if filtered:
-            rag = filtered
-    return random.sample(rag, k=min(max_chunks, len(rag)))
-
-
-def parse_section_lengths(raw: Optional[str], sections: int) -> List[int]:
-    """Parse a JSON list of section lengths; fill missing with defaults."""
-    if not raw:
-        return [DEFAULT_SECTION_CHAR_MAX] * max(0, sections)
-    try:
-        arr = json.loads(raw)
-        if isinstance(arr, list):
-            vals = []
-            for v in arr:
-                if isinstance(v, (int, float)):
-                    vals.append(int(v))
-            if len(vals) < sections:
-                vals.extend([DEFAULT_SECTION_CHAR_MAX] * (sections - len(vals)))
-            return vals[:sections]
-    except Exception:
-        pass
-    return [DEFAULT_SECTION_CHAR_MAX] * max(0, sections)
-
-
-def parse_section_para_counts(raw: Optional[str], sections: int, default_count: int) -> List[int]:
-    """Parse a JSON list of paragraph counts; fill missing with default."""
-    if not raw:
-        return [default_count] * max(0, sections)
-    try:
-        arr = json.loads(raw)
-        if isinstance(arr, list):
-            vals = []
-            for v in arr:
-                if isinstance(v, int) and v > 0:
-                    vals.append(v)
-            if len(vals) < sections:
-                vals.extend([default_count] * (sections - len(vals)))
-            return vals[:sections]
-    except Exception:
-        pass
-    return [default_count] * max(0, sections)
-
-
-def build_prompt(
-    content_type: str,
-    char_budget: int,
-    tone: str,
-    audience: str,
-    context: List[dict],
-    notes: Optional[str] = None,
-) -> str:
-    ctx_lines = []
-    for i, rec in enumerate(context, start=1):
-        txt = str(rec.get("text", "")).strip()
-        if not txt:
-            continue
-        slot = rec.get("slot_type", "") or rec.get("band", "")
-        ctx_lines.append(f"{i}) [{slot}] {txt}")
-    ctx_block = "\n".join(ctx_lines) if ctx_lines else "None provided."
-    note_line = f"- Context notes: {notes}" if notes else ""
-    prompt = textwrap.dedent(
-        f"""
-        You are writing the main body copy for a {content_type} website.
-        - Audience: {audience}
-        - Tone: {tone}
-        - Length: about {char_budget} characters. Keep it concise; avoid filler.
-        - Style: cohesive paragraph(s), no headings or lists, avoid placeholders, plain text.
-        - Context snippets (use as inspiration, do not quote verbatim):
-        {ctx_block}
-        {note_line}
-        If anything is ambiguous, pick reasonable details that fit the category. Return only the body text.
-        """
-    ).strip()
-    return prompt
-
-
-def call_hf_chat(
-    prompt: str,
-    model_id: str,
-    token: str,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-) -> str:
-    """Call HF router using OpenAI-compatible chat/completions API."""
-    if not token:
-        raise RuntimeError("HUGGINGFACE_TOKEN (or HF_TOKEN) is required to call the API")
-
-    url = "https://router.huggingface.co/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {token}"}
-    payload: Dict[str, Any] = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_new_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "stream": False,
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        raise RuntimeError(f"Unexpected HF chat response: {data}") from exc
-
-
-def generate_site_name(
-    token: str,
-    model_id: str,
-    content_type: str,
-    audience: str,
-    tone: str,
-    notes: Optional[str],
-    context: List[dict],
-    temperature: float,
-    top_p: float,
-) -> Tuple[str, str]:
-    """Return (site_name, prompt_used)."""
-    ctx_lines = []
-    for i, rec in enumerate(context[:2], start=1):
-        txt = str(rec.get("text", "")).strip()
-        if txt:
-            ctx_lines.append(f"{i}) {txt}")
-    ctx_block = "\n".join(ctx_lines) if ctx_lines else "None provided."
-    note_line = f"- Notes: {notes}" if notes else ""
-    prompt = textwrap.dedent(
-        f"""
-        Propose a short brand-style site name for a {content_type} website.
-        - Audience: {audience}
-        - Tone: {tone}
-        - Context snippets (inspiration only): {ctx_block}
-        {note_line}
-        Return only the name, 1-3 words, no quotes or punctuation.
-        """
-    ).strip()
-    name = call_hf_chat(
-        prompt=prompt,
-        model_id=model_id,
-        token=token,
-        max_new_tokens=48,
-        temperature=temperature,
-        top_p=top_p,
-    )
-    return name.strip(), prompt
-
-
-def generate_hero(
-    token: str,
-    model_id: str,
-    site_name: str,
-    content_type: str,
-    audience: str,
-    tone: str,
-    notes: Optional[str],
-    target_title_chars: int,
-    target_subtitle_chars: int,
-    temperature: float,
-    top_p: float,
-) -> Tuple[Dict[str, str], str]:
-    """Return (hero_dict, prompt_used)."""
-    prompt = textwrap.dedent(
-        f"""
-        You are writing the hero copy for a {content_type} site named "{site_name}".
-        - Audience: {audience}
-        - Tone: {tone}
-        - Title length: about {target_title_chars} characters.
-        - Subtitle length: about {target_subtitle_chars} characters.
-        {f"- Notes: {notes}" if notes else ""}
-        Return ONLY valid JSON with keys hero_title and hero_subtitle. No backticks, no markdown.
-        """
-    ).strip()
-    raw = call_hf_chat(
-        prompt=prompt,
-        model_id=model_id,
-        token=token,
-        max_new_tokens=budget_to_max_tokens(target_title_chars + target_subtitle_chars),
-        temperature=temperature,
-        top_p=top_p,
-    )
-    hero = {"hero_title": "", "hero_subtitle": ""}
-    # Clean possible fences
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
+#!/usr/bin/env python3 import argparse import json import math import os import random import textwrap from pathlib import Path from typing import Any, Dict, List, Optional, Sequence, Tuple import requests DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct:together" DEFAULT_CHAR_WIDTH_FACTOR = 0.52 # avg em width vs font size DEFAULT_LINE_HEIGHT = 1.4 DEFAULT_FILL_RATIO = 0.9 MAX_CONTEXT_CHUNKS = 3 DEFAULT_SECTION_CHAR_MIN = 250 DEFAULT_SECTION_CHAR_MAX = 400 DEFAULT_HERO_TITLE_CHARS = 80 DEFAULT_HERO_SUBTITLE_CHARS = 200 DEFAULT_SECTION_PARA_COUNT = 3 def clamp(val: float, lo: float, hi: float) -> float: return max(lo, min(hi, val)) def estimate_char_budget( width_px: float, height_px: float, font_size_px: float = 16.0, line_height: float = DEFAULT_LINE_HEIGHT, char_width_factor: float = DEFAULT_CHAR_WIDTH_FACTOR, fill_ratio: float = DEFAULT_FILL_RATIO, min_chars: int = 120, max_chars: int = 1200, ) -> int: width_px = max(16.0, width_px) height_px = max(16.0, height_px) font_size_px = max(8.0, font_size_px) line_height_px = font_size_px * max(1.05, line_height) chars_per_line = width_px / (font_size_px * max(0.3, char_width_factor)) line_count = height_px / line_height_px rough_budget = int(chars_per_line * line_count * clamp(fill_ratio, 0.5, 1.0)) return int(clamp(rough_budget, float(min_chars), float(max_chars))) def budget_to_max_tokens(char_budget: int, safety: float = 1.3) -> int: return int(math.ceil((char_budget / 4.0) * safety)) def load_rag(path: Optional[Path], max_items: Optional[int] = None) -> List[dict]: if not path: return [] if not path.exists(): return [] items: List[dict] = [] with path.open("r", encoding="utf-8") as f: for line in f: line = line.strip() if not line: continue try: rec = json.loads(line) items.append(rec) except Exception: continue if max_items and len(items) >= max_items: break return items def pick_context( rag: Sequence[dict], strategy: str, max_chunks: int, content_type: str, ) -> List[dict]: if not rag or max_chunks <= 0: return [] if strategy == "topic" and content_type: filtered = [r for r in rag if content_type.lower() in str(r.get("topic", "")).lower()] if filtered: rag = filtered return random.sample(rag, k=min(max_chunks, len(rag))) def parse_section_lengths(raw: Optional[str], sections: int) -> List[int]: if not raw: return [DEFAULT_SECTION_CHAR_MAX] * max(0, sections) try: arr = json.loads(raw) if isinstance(arr, list): vals = [] for v in arr: if isinstance(v, (int, float)): vals.append(int(v)) if len(vals) < sections: vals.extend([DEFAULT_SECTION_CHAR_MAX] * (sections - len(vals))) return vals[:sections] except Exception: pass return [DEFAULT_SECTION_CHAR_MAX] * max(0, sections) def parse_section_para_counts(raw: Optional[str], sections: int, default_count: int) -> List[int]: if not raw: return [default_count] * max(0, sections) try: arr = json.loads(raw) if isinstance(arr, list): vals = [] for v in arr: if isinstance(v, int) and v > 0: vals.append(v) if len(vals) < sections: vals.extend([default_count] * (sections - len(vals))) return vals[:sections] except Exception: pass return [default_count] * max(0, sections) def build_prompt( content_type: str, char_budget: int, tone: str, audience: str, context: List[dict], notes: Optional[str] = None, ) -> str: ctx_lines = [] for i, rec in enumerate(context, start=1): txt = str(rec.get("text", "")).strip() if not txt: continue slot = rec.get("slot_type", "") or rec.get("band", "") ctx_lines.append(f"{i}) [{slot}] {txt}") ctx_block = "\n".join(ctx_lines) if ctx_lines else "None provided." note_line = f"- Context notes: {notes}" if notes else "" prompt = textwrap.dedent( f""" You are writing the main body copy for a {content_type} website. - Audience: {audience} - Tone: {tone} - Length: about {char_budget} characters. Keep it concise; avoid filler. - Style: cohesive paragraph(s), no headings or lists, avoid placeholders, plain text. - Context snippets (use as inspiration, do not quote verbatim): {ctx_block} {note_line} If anything is ambiguous, pick reasonable details that fit the category. Return only the body text. """ ).strip() return prompt def call_hf_chat( prompt: str, model_id: str, token: str, max_new_tokens: int, temperature: float, top_p: float, ) -> str: if not token: raise RuntimeError("HUGGINGFACE_TOKEN (or HF_TOKEN) is required to call the API") url = "https://router.huggingface.co/v1/chat/completions" headers = {"Authorization": f"Bearer {token}"} payload: Dict[str, Any] = { "model": model_id, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_new_tokens, "temperature": temperature, "top_p": top_p, "stream": False, } resp = requests.post(url, headers=headers, json=payload, timeout=60) resp.raise_for_status() data = resp.json() try: return data["choices"][0]["message"]["content"].strip() except Exception as exc: raise RuntimeError(f"Unexpected HF chat response: {data}") from exc def generate_site_name( token: str, model_id: str, content_type: str, audience: str, tone: str, notes: Optional[str], context: List[dict], temperature: float, top_p: float, ) -> Tuple[str, str]: ctx_lines = [] for i, rec in enumerate(context[:2], start=1): txt = str(rec.get("text", "")).strip() if txt: ctx_lines.append(f"{i}) {txt}") ctx_block = "\n".join(ctx_lines) if ctx_lines else "None provided." note_line = f"- Notes: {notes}" if notes else "" prompt = textwrap.dedent( f""" Propose a short brand-style site name for a {content_type} website. - Audience: {audience} - Tone: {tone} - Context snippets (inspiration only): {ctx_block} {note_line} Return only the name, 1-3 words, no quotes or punctuation. """ ).strip() name = call_hf_chat( prompt=prompt, model_id=model_id, token=token, max_new_tokens=48, temperature=temperature, top_p=top_p, ) return name.strip(), prompt def generate_hero( token: str, model_id: str, site_name: str, content_type: str, audience: str, tone: str, notes: Optional[str], target_title_chars: int, target_subtitle_chars: int, temperature: float, top_p: float, ) -> Tuple[Dict[str, str], str]: prompt = textwrap.dedent( f""" You are writing the hero copy for a {content_type} site named "{site_name}". - Audience: {audience} - Tone: {tone} - Title length: about {target_title_chars} characters. - Subtitle length: about {target_subtitle_chars} characters. {f"- Notes: {notes}" if notes else ""} Return ONLY valid JSON with keys hero_title and hero_subtitle. No backticks, no markdown. """ ).strip() raw = call_hf_chat( prompt=prompt, model_id=model_id, token=token, max_new_tokens=budget_to_max_tokens(target_title_chars + target_subtitle_chars), temperature=temperature, top_p=top_p, ) hero = {"hero_title": "", "hero_subtitle": ""} # Clean possible fences cleaned = raw.strip() if cleaned.startswith("
+"):
         cleaned = cleaned.strip("`").strip()
         if cleaned.lower().startswith("json"):
             cleaned = cleaned[4:].strip()
@@ -307,7 +30,6 @@ def plan_sections(
     temperature: float,
     top_p: float,
 ) -> Tuple[List[dict], str]:
-    """Return (sections_plan, prompt_used), where plan is list of {heading,intent}."""
     prompt = textwrap.dedent(
         f"""
         Propose exactly {sections} section headings for a {content_type} site named "{site_name}".
@@ -350,7 +72,6 @@ def plan_sections(
 
 
 def sanitize_heading(text: str, fallback: str) -> str:
-    """Avoid feeding malformed headings downstream."""
     if not text:
         return fallback
     if text.startswith("[") or text.startswith("{"):
@@ -373,7 +94,6 @@ def generate_section_body(
     temperature: float,
     top_p: float,
 ) -> Tuple[str, str]:
-    """Return (body_text, prompts_used joined). Generate paragraphs separately to reduce repetition."""
     prior_takeaway = ""
     if previous_body:
         prior_takeaway = previous_body.split(".")[0][:120]
@@ -429,9 +149,6 @@ def generate_section_body(
     body_text = "\n\n".join(paragraphs)
     return body_text, "\n\n".join(prompts_used)
 
-
-# ---------------- CLI ----------------
-
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser("Generate web body copy sized to a wireframe box")
     ap.add_argument("--content_type", default="product", help="e.g., fintech, SaaS, nonprofit")
@@ -483,7 +200,6 @@ def main() -> None:
     if not token:
         token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
 
-    # Staged mode: sections > 0
     if args.sections and args.sections > 0:
         lengths = parse_section_lengths(args.section_lengths, args.sections)
         para_counts = parse_section_para_counts(args.section_para_counts, args.sections, args.section_para_count)
@@ -551,7 +267,6 @@ def main() -> None:
             # pad with generic headings
             for i in range(len(plan), args.sections):
                 plan.append({"heading": f"Section {i+1}", "intent": ""})
-        # sanitize headings
         for i, item in enumerate(plan):
             plan[i]["heading"] = sanitize_heading(item.get("heading", ""), fallback=f"Section {i+1}")
 
@@ -611,7 +326,6 @@ def main() -> None:
             print(rendered)
         return
 
-    # Legacy single-body mode (width/height -> char budget)
     if args.width_px is None or args.height_px is None:
         raise SystemExit("width_px and height_px are required when sections=0")
 
